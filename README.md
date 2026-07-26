@@ -13,6 +13,7 @@ Deploy [Hermes Agent](https://github.com/NousResearch/hermes-agent) on [Railway]
 
 - **Admin Dashboard** — dark-themed UI to configure providers, channels, tools, and manage the gateway
 - **One-Page Setup** — provider dropdown, checkbox-based channel/tool toggles — no config files to edit
+- **iMessage** — connect [Photon](https://photon.codes/) with one click (no Mac required) or bridge your own [BlueBubbles](https://bluebubbles.app/) server; inbound webhooks are relayed automatically
 - **Gateway Management** — start, stop, restart the Hermes gateway from the browser
 - **Live Status** — stat cards for gateway state, uptime, model, and pending pairing requests
 - **Live Logs** — streaming gateway log viewer
@@ -77,7 +78,68 @@ OpenRouter, DeepSeek, DashScope, GLM / Z.AI, Kimi, MiniMax, HuggingFace
 
 ## Supported Channels
 
-Telegram, Discord, Slack, WhatsApp, Email, Mattermost, Matrix
+Telegram, Discord, Slack, iMessage, WhatsApp, Email, Mattermost, Matrix
+
+## iMessage
+
+Hermes ships two independent iMessage integrations, and this template wires up both.
+They sit in the **Messaging Channels** section of the setup page.
+
+### Photon — recommended, no Mac required
+
+[Photon](https://photon.codes/) is a managed service that owns the iMessage line for you.
+The gateway holds an **outbound** gRPC stream to it, so there is nothing to expose and
+nothing else to run — the only iMessage path that works on a stock Railway deploy.
+
+1. Tick **iMessage · Photon**, enter your own phone number in E.164 (`+15551234567`)
+2. Click **Connect Photon** — a tab opens where you approve a short code
+3. The dashboard then provisions everything for you: a Photon project, its API secret,
+   your number registered as a Spectrum user, and the allowlist + home channel
+4. When it finishes, the panel shows **the number to text** to reach your agent
+
+Photon's free tier uses a shared iMessage line pool, so you can start without a paid plan.
+Credentials land in `/data/.hermes/.env` (`PHOTON_PROJECT_ID`, `PHOTON_PROJECT_SECRET`)
+and `/data/.hermes/auth.json`, exactly where `hermes photon status` looks for them.
+
+> The Node sidecar that runs Photon's `spectrum-ts` SDK is pre-installed into the image at
+> build time (`npm ci`). If you see a warning that it's missing, rebuild from the current
+> `Dockerfile` and redeploy — `/opt` is baked into the image, so it can't be installed at runtime.
+
+### BlueBubbles — bring your own Mac
+
+[BlueBubbles](https://bluebubbles.app/) bridges iMessage from an always-on Mac signed into
+Messages.app. Use it if you want your own number rather than a Photon line.
+
+1. Install BlueBubbles Server on the Mac, sign in, and make it reachable from the internet
+   (Ngrok, a Cloudflare tunnel, or dynamic DNS) — copy the **Server URL** and **Password**
+   from Settings → API
+2. Tick **iMessage · BlueBubbles**, paste both, and **Save & Start**
+3. The panel's **Test connection** button confirms the server is reachable and that the
+   inbound webhook is registered
+
+**About the webhook.** BlueBubbles delivers incoming messages by POSTing to a URL you
+register with it, and the gateway's own listener binds loopback-only — unreachable from
+your Mac, and Railway publishes just one port. So this template exposes a public relay at
+`POST /<your-app>/bluebubbles-webhook` that verifies the BlueBubbles password (the same
+shared secret the gateway checks — constant-time compared at the edge) and forwards the
+body to the gateway internally. Saving the config registers that URL with your server
+automatically, prunes registrations left behind by an old domain or a rotated password,
+and leaves the gateway's own loopback entry alone. Use **Register webhook** to re-sync by
+hand. Set `BLUEBUBBLES_PUBLIC_URL` only if a proxy in front of this app rewrites `Host`.
+
+Either channel routes unknown senders into the **Users** tab as pairing requests, same as
+Telegram or Discord.
+
+### Notes
+
+- **Configure iMessage from this setup page, not the Hermes dashboard.** Hermes' own
+  Channels page lists both, but its Photon card just tells you to run `hermes photon setup`
+  — a TTY wizard that can't run in this container. Toggling a channel off there also writes
+  a sticky `enabled: false` that would override the credentials you saved here; saving from
+  this page clears it again for the channel you enabled.
+- **Reconnecting Photon rotates the project secret.** Photon only reveals a secret once, so
+  connecting mints a fresh one and invalidates the previous value. Disconnect first if you
+  need to, and don't share one Photon project between two deployments.
 
 ## Supported Tool Integrations
 
@@ -88,10 +150,13 @@ Parallel (search), Firecrawl (scraping), Tavily (search), FAL (image gen), Brows
 ```
 Railway Container
 ├── Python Admin Server (Starlette + Uvicorn)
-│   ├── /            — Admin dashboard (Basic Auth)
-│   ├── /health      — Health check (no auth)
-│   └── /api/*       — Config, status, logs, gateway, pairing
-└── hermes gateway   — Managed as async subprocess
+│   ├── /                     — Admin dashboard (Basic Auth)
+│   ├── /health               — Health check (no auth)
+│   ├── /bluebubbles-webhook  — Inbound iMessage relay (password-gated, no cookie)
+│   └── /api/*                — Config, status, logs, gateway, pairing
+└── hermes gateway            — Managed as async subprocess
+    ├── BlueBubbles listener  — 127.0.0.1:8645 (fed by the relay above)
+    └── Photon sidecar        — 127.0.0.1:8789, outbound gRPC to Photon
 ```
 
 The admin server runs on `$PORT` and manages the Hermes gateway as a child process. Config is stored in `/data/.hermes/.env` and `/data/.hermes/config.yaml`. Gateway stdout/stderr is captured into a ring buffer and streamed to the Logs panel.

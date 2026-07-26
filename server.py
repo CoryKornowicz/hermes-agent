@@ -29,6 +29,8 @@ injected into every proxied HTML response so users can always return to the wiza
 from __future__ import annotations
 
 import asyncio
+import hashlib as _hashlib
+import hmac as _hmac
 import json
 import os
 import re
@@ -41,6 +43,7 @@ import zipfile
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import quote as _url_quote, urlparse as _urlparse
 
 import httpx
 import websockets
@@ -191,6 +194,68 @@ ENV_VARS = [
     ("MATRIX_HOMESERVER",        "Homeserver URL",           "matrix",    False),
     ("MATRIX_ACCESS_TOKEN",      "Access Token",             "matrix",    True),
     ("MATRIX_USER_ID",           "User ID",                  "matrix",    False),
+    # ── iMessage ────────────────────────────────────────────────────────────
+    # Hermes ships TWO independent iMessage integrations; this template wires
+    # up both because they have opposite trade-offs on Railway:
+    #
+    #   photon      — the bundled `photon-platform` plugin (plugins/platforms/
+    #                 photon, kind: platform → auto-registered, no `hermes
+    #                 plugins enable` needed). Photon is a managed service that
+    #                 owns the iMessage line; the gateway holds an OUTBOUND
+    #                 gRPC stream to it through a small Node sidecar on
+    #                 loopback. No public URL, no webhook, no Mac. This is the
+    #                 only iMessage path that works on a stock Railway deploy
+    #                 with zero networking setup, so it's the one the UI leads
+    #                 with. Setting PHOTON_PROJECT_ID + PHOTON_PROJECT_SECRET
+    #                 is all the gateway needs — the platform auto-enables via
+    #                 the plugin's own env_enablement_fn.
+    #
+    #   bluebubbles — the built-in platform (gateway/platforms/bluebubbles.py).
+    #                 Bridges to a BlueBubbles server on your OWN always-on
+    #                 Mac. Outbound REST is fine, but inbound needs a webhook
+    #                 the Mac can POST to — which a single-public-port
+    #                 container can't offer natively. See the
+    #                 /bluebubbles-webhook relay further down.
+    ("PHOTON_PROJECT_ID",        "Spectrum Project ID",      "photon",    False),
+    ("PHOTON_PROJECT_SECRET",    "Project Secret",           "photon",    True),
+    ("PHOTON_ALLOWED_USERS",     "Allowed Numbers",          "photon",    False),
+    ("PHOTON_HOME_CHANNEL",      "Home Channel",             "photon",    False),
+    ("PHOTON_REQUIRE_MENTION",   "Require mention in groups","photon",    False),
+    ("BLUEBUBBLES_SERVER_URL",   "Server URL",               "bluebubbles", False),
+    ("BLUEBUBBLES_PASSWORD",     "Server Password",          "bluebubbles", True),
+    ("BLUEBUBBLES_ALLOWED_USERS","Allowed Handles",          "bluebubbles", False),
+    ("BLUEBUBBLES_HOME_CHANNEL", "Home Chat GUID",           "bluebubbles", False),
+    # Advanced knobs the setup UI deliberately doesn't surface. Declared anyway
+    # because BOTH admin surfaces write this same .env: hermes' own dashboard
+    # exposes every one of these on its Channels page (its OPTIONAL_ENV_VARS
+    # registry, plus the photon plugin.yaml's optional_env injected at runtime),
+    # and anything we don't classify here gets relocated into the "# Other"
+    # bucket the next time /setup saves. Keeping them registered keeps the file
+    # readable no matter which UI last touched it — and gives the webhook relay
+    # and hermes one shared source of truth for the loopback listener.
+    ("PHOTON_ALLOW_ALL_USERS",     "Allow all senders",       "photon",    False),
+    ("PHOTON_MENTION_PATTERNS",    "Mention patterns",        "photon",    False),
+    ("PHOTON_HOME_CHANNEL_NAME",   "Home channel label",      "photon",    False),
+    ("PHOTON_MARKDOWN",            "Send markdown",           "photon",    False),
+    ("PHOTON_REACTIONS",           "Tapback reactions",       "photon",    False),
+    ("PHOTON_TELEMETRY",           "Spectrum telemetry",      "photon",    False),
+    ("PHOTON_SIDECAR_PORT",        "Sidecar port (loopback)", "photon",    False),
+    ("PHOTON_SIDECAR_TOKEN",       "Sidecar token",           "photon",    True),
+    ("PHOTON_DASHBOARD_HOST",      "Dashboard API host",      "photon",    False),
+    ("PHOTON_SPECTRUM_HOST",       "Spectrum API host",       "photon",    False),
+    ("BLUEBUBBLES_ALLOW_ALL_USERS",   "Allow all senders",       "bluebubbles", False),
+    ("BLUEBUBBLES_REQUIRE_MENTION",   "Require mention in groups","bluebubbles", False),
+    ("BLUEBUBBLES_MENTION_PATTERNS",  "Mention patterns",        "bluebubbles", False),
+    ("BLUEBUBBLES_SEND_READ_RECEIPTS","Send read receipts",      "bluebubbles", False),
+    ("BLUEBUBBLES_HOME_CHANNEL_NAME", "Home chat label",         "bluebubbles", False),
+    ("BLUEBUBBLES_WEBHOOK_HOST", "Webhook bind host",        "bluebubbles", False),
+    ("BLUEBUBBLES_WEBHOOK_PORT", "Webhook port (loopback)",  "bluebubbles", False),
+    ("BLUEBUBBLES_WEBHOOK_PATH", "Webhook path (loopback)",  "bluebubbles", False),
+    # Template-local, NOT an upstream hermes variable: hermes' own adapter has
+    # no concept of an external webhook URL (it always derives one from the host
+    # it binds), so this is purely the relay's override for deployments behind a
+    # proxy that rewrites Host.
+    ("BLUEBUBBLES_PUBLIC_URL",   "Public URL override",      "bluebubbles", False),
     ("GATEWAY_ALLOW_ALL_USERS",  "Allow all users",          "gateway",   False),
     ("ADMIN_USERNAME",           "Admin username",           "admin",     False),
     ("ADMIN_PASSWORD",           "Admin password",           "admin",     True),
@@ -271,6 +336,13 @@ CUSTOM_STYLE_BASE_URLS = {
 # no other code needs to change.
 HERMES_CUSTOM_STYLE_KEYS = {k for k, v in HERMES_PROVIDER_IDS.items() if v == "custom"}
 
+# Channel → the env var(s) that must ALL be set for the gateway to enable it.
+# A tuple means "every one of these", which is what the two iMessage channels
+# need: hermes gates both on a pair (gateway/config.py's bluebubbles block wants
+# URL *and* password; the photon plugin's env_enablement_fn wants project id
+# *and* secret). Reporting a channel as configured off the first value alone
+# would light the Status chip green for a half-filled form that can never
+# connect.
 CHANNEL_MAP  = {
     "Telegram":    "TELEGRAM_BOT_TOKEN",
     "Discord":     "DISCORD_BOT_TOKEN",
@@ -279,6 +351,8 @@ CHANNEL_MAP  = {
     "Email":       "EMAIL_ADDRESS",
     "Mattermost":  "MATTERMOST_TOKEN",
     "Matrix":      "MATRIX_ACCESS_TOKEN",
+    "iMessage (Photon)":      ("PHOTON_PROJECT_ID", "PHOTON_PROJECT_SECRET"),
+    "iMessage (BlueBubbles)": ("BLUEBUBBLES_SERVER_URL", "BLUEBUBBLES_PASSWORD"),
 }
 
 
@@ -457,20 +531,32 @@ def build_hermes_env() -> dict[str, str]:
     return env
 
 
+# Section order + headings for the generated .env. Module-level (rather than
+# local to write_env) so the "every ENV_VARS category appears here" invariant is
+# assertable from outside — see write_env's leftover sweep for why drifting
+# apart used to be silent data loss.
+WRITE_ENV_CAT_ORDER = [
+    "model", "provider", "bedrock", "azure", "custom", "tool",
+    "telegram", "discord", "slack", "whatsapp",
+    "email", "mattermost", "matrix", "photon", "bluebubbles",
+    "gateway", "admin",
+]
+WRITE_ENV_CAT_LABELS = {
+    "model": "Model", "provider": "Providers",
+    "bedrock": "AWS Bedrock", "azure": "Azure Foundry",
+    "custom": "Custom Endpoint", "tool": "Tools",
+    "telegram": "Telegram", "discord": "Discord", "slack": "Slack",
+    "whatsapp": "WhatsApp", "email": "Email",
+    "mattermost": "Mattermost", "matrix": "Matrix",
+    "photon": "iMessage (Photon)", "bluebubbles": "iMessage (BlueBubbles)",
+    "gateway": "Gateway", "admin": "Admin",
+}
+
+
 def write_env(path: Path, data: dict[str, str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    cat_order = ["model", "provider", "bedrock", "azure", "custom", "tool",
-                 "telegram", "discord", "slack", "whatsapp",
-                 "email", "mattermost", "matrix", "gateway", "admin"]
-    cat_labels = {
-        "model": "Model", "provider": "Providers",
-        "bedrock": "AWS Bedrock", "azure": "Azure Foundry",
-        "custom": "Custom Endpoint", "tool": "Tools",
-        "telegram": "Telegram", "discord": "Discord", "slack": "Slack",
-        "whatsapp": "WhatsApp", "email": "Email",
-        "mattermost": "Mattermost", "matrix": "Matrix", "gateway": "Gateway",
-        "admin": "Admin",
-    }
+    cat_order = WRITE_ENV_CAT_ORDER
+    cat_labels = WRITE_ENV_CAT_LABELS
     key_cat = {k: c for k, _, c, _ in ENV_VARS}
     grouped: dict[str, list[str]] = {c: [] for c in cat_order}
     grouped["other"] = []
@@ -482,7 +568,12 @@ def write_env(path: Path, data: dict[str, str]) -> None:
         grouped.setdefault(cat, []).append(f"{k}={v}")
 
     lines: list[str] = []
-    for cat in cat_order:
+    # Any category present in ENV_VARS but missing from cat_order would
+    # otherwise be silently dropped on every save — the grouped dict grows a
+    # bucket for it that no emit loop ever reads, so the value disappears from
+    # .env the first time the user hits Save. Sweep the leftovers in instead of
+    # trusting the two lists to stay in sync by hand.
+    for cat in [*cat_order, *(c for c in grouped if c not in cat_order and c != "other")]:
         entries = sorted(grouped.get(cat, []))
         if entries:
             lines.append(f"# {cat_labels.get(cat, cat)}")
@@ -741,6 +832,873 @@ async def api_oauth_xai_status(request: Request) -> Response:
     })
 
 
+# ── iMessage via Photon (Device Code — RFC 8628 + Spectrum provisioning) ─────
+# Reimplements the management-plane half of `hermes photon setup`
+# (plugins/platforms/photon/{cli,auth}.py, verified against v2026.7.1) as a
+# browser-driven flow, exactly like the xAI block above does for `hermes auth`.
+#
+# Why reimplement rather than shell out to `hermes photon setup`:
+#   1. That subcommand does not exist in a fresh CLI process. It is registered
+#      from the plugin's register(ctx), and bundled `kind: platform` plugins are
+#      loaded LAZILY — hermes_cli/plugins.py takes the _register_deferred_platform
+#      branch and never imports the module during CLI discovery, so nothing ever
+#      calls register_cli_command(). `hermes photon setup` only resolves once
+#      something has already pulled the platform out of the registry.
+#   2. Even where it resolves, it is a TTY wizard: it prints the device URL and
+#      code to stdout as box-drawing art, blocks on an interactive phone-number
+#      prompt, and tries to open a local browser. Scraping that output would
+#      couple us to its print formatting.
+# The management API underneath it is plain JSON over two hosts and is what the
+# official Photon CLI speaks, so we call it directly and write the SAME on-disk
+# artifacts the plugin does:
+#
+#   $HERMES_HOME/.env        PHOTON_PROJECT_ID / PHOTON_PROJECT_SECRET
+#                            (+ PHOTON_ALLOWED_USERS / PHOTON_HOME_CHANNEL,
+#                            seeded only when unset — mirrors the plugin's
+#                            _autoconfigure_access)
+#   $HERMES_HOME/auth.json   credential_pool.photon        (device bearer)
+#                            credential_pool.photon_project (ids + secret)
+#                            credential_pool.photon_user    (numbers)
+#
+# Writing the same shapes keeps `hermes photon status` and the plugin's own
+# load_project_credentials() in agreement with this panel — no split-brain.
+#
+# Re-verify the endpoint paths and JSON keys below against
+# plugins/platforms/photon/auth.py on a HERMES_REF bump.
+_PHOTON_CLIENT_ID     = "photon-cli"   # Photon allowlists device clients; this is the published CLI id
+_PHOTON_SCOPE         = "openid profile email"
+_PHOTON_DASHBOARD_URL = "https://app.photon.codes"
+_PHOTON_SPECTRUM_URL  = "https://spectrum.photon.codes"
+_PHOTON_PROJECT_NAME  = "Hermes Agent"
+_PHOTON_GRANT_TYPE    = "urn:ietf:params:oauth:grant-type:device_code"
+_PHOTON_E164_RE       = re.compile(r"^\+[1-9]\d{6,14}$")
+
+# Where the Dockerfile clones hermes-agent. The Photon adapter refuses to
+# connect unless the Node sidecar's node_modules/ exists next to it
+# (plugins/platforms/photon/adapter.py:check_requirements), so we surface that
+# as a precondition in the UI instead of letting the gateway fail at connect.
+HERMES_SRC_DIR = Path(os.environ.get("HERMES_SRC_DIR", "/opt/hermes-agent"))
+_PHOTON_SIDECAR_DIR = HERMES_SRC_DIR / "plugins" / "platforms" / "photon" / "sidecar"
+
+_photon_state: dict | None = None  # one connect flow at a time (single-user deployment)
+
+
+def _read_auth_json() -> dict:
+    path = Path(HERMES_HOME) / "auth.json"
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_auth_json(data: dict) -> None:
+    path = Path(HERMES_HOME) / "auth.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+
+
+def _photon_host(kind: str) -> str:
+    """Dashboard/Spectrum host, honouring the plugin's own env overrides."""
+    env = read_env(ENV_FILE)
+    if kind == "spectrum":
+        return (env.get("PHOTON_SPECTRUM_HOST") or os.environ.get("PHOTON_SPECTRUM_HOST")
+                or _PHOTON_SPECTRUM_URL).rstrip("/")
+    return (env.get("PHOTON_DASHBOARD_HOST") or os.environ.get("PHOTON_DASHBOARD_HOST")
+            or _PHOTON_DASHBOARD_URL).rstrip("/")
+
+
+def _photon_basic(project_id: str, project_secret: str) -> dict[str, str]:
+    from base64 import b64encode
+    token = b64encode(f"{project_id}:{project_secret}".encode()).decode("ascii")
+    return {"Authorization": f"Basic {token}"}
+
+
+def _photon_error_detail(resp: httpx.Response) -> str:
+    try:
+        data = resp.json()
+    except Exception:
+        data = None
+    if isinstance(data, dict):
+        for key in ("error", "message", "detail"):
+            if data.get(key):
+                return str(data[key])
+    return (resp.text or "")[:300] or f"HTTP {resp.status_code}"
+
+
+def _photon_unwrap_list(data) -> list[dict]:
+    """Photon list endpoints have wrapped their payload differently over time."""
+    if isinstance(data, list):
+        return [d for d in data if isinstance(d, dict)]
+    if isinstance(data, dict):
+        for key in ("data", "projects", "users", "lines", "items"):
+            inner = data.get(key)
+            if isinstance(inner, list):
+                return [d for d in inner if isinstance(d, dict)]
+            if isinstance(inner, dict):
+                for nested in ("projects", "users", "lines", "items"):
+                    if isinstance(inner.get(nested), list):
+                        return [d for d in inner[nested] if isinstance(d, dict)]
+    return []
+
+
+def _photon_token_from_response(resp: httpx.Response) -> str:
+    """Extract the bearer token from a device-token 200.
+
+    Photon has returned it under several keys across versions, plus a
+    documented `set-auth-token` response header — mirror the plugin's
+    _device_response_token_candidates() so a shape change doesn't 500 us.
+    """
+    try:
+        body = resp.json() or {}
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    session = body.get("session") if isinstance(body.get("session"), dict) else {}
+    data = body.get("data") if isinstance(body.get("data"), dict) else {}
+    for candidate in (
+        body.get("access_token"), body.get("accessToken"),
+        session.get("access_token"),
+        data.get("access_token"), data.get("accessToken"),
+        resp.headers.get("set-auth-token"),
+    ):
+        if isinstance(candidate, str) and candidate.strip():
+            token = candidate.strip()
+            if token.lower().startswith("bearer "):
+                token = token[7:].strip()
+            if token:
+                return token
+    return ""
+
+
+def _photon_creds() -> tuple[str, str]:
+    """(project_id, project_secret) — .env first, then auth.json.
+
+    Same precedence as the plugin's load_project_credentials(), so what this
+    panel reports matches what the gateway will actually boot with.
+    """
+    env = read_env(ENV_FILE)
+    pid, secret = env.get("PHOTON_PROJECT_ID", ""), env.get("PHOTON_PROJECT_SECRET", "")
+    if pid and secret:
+        return pid, secret
+    pool = _read_auth_json().get("credential_pool", {}).get("photon_project") or []
+    if isinstance(pool, list) and pool and isinstance(pool[0], dict):
+        entry = pool[0]
+        return (pid or entry.get("spectrum_project_id") or entry.get("project_id") or "",
+                secret or entry.get("project_secret") or "")
+    return pid, secret
+
+
+def _photon_stored_numbers() -> tuple[str, str]:
+    """(operator_phone, assigned_imessage_line) from auth.json, for display."""
+    pool = _read_auth_json().get("credential_pool", {}).get("photon_user") or []
+    if isinstance(pool, list) and pool and isinstance(pool[0], dict):
+        entry = pool[0]
+        return str(entry.get("phone_number") or ""), str(entry.get("assigned_phone_number") or "")
+    return "", ""
+
+
+def _photon_sidecar_ready() -> bool:
+    try:
+        return (_PHOTON_SIDECAR_DIR / "node_modules").is_dir()
+    except OSError:
+        return False
+
+
+def _clear_platform_disable(platform_id: str) -> None:
+    """Drop a sticky ``enabled: false`` for *platform_id* from config.yaml.
+
+    Hermes' own dashboard has a Channels page, and toggling a channel off there
+    writes ``platforms.<id>.enabled`` into the same config.yaml this template
+    manages. gateway/config.py turns ANY explicit value into an
+    ``extra._enabled_explicit`` flag that permanently vetoes the env-driven
+    auto-enable both iMessage channels depend on — and write_config_yaml()
+    deep-merges, so the veto survives every save we make.
+
+    With two admin surfaces over one config that is easy to hit by accident:
+    switch iMessage off in the Hermes dashboard, reconnect it here, and the
+    gateway would go on ignoring the channel while both UIs report it as set up.
+    Scoped deliberately to a channel the user just explicitly turned ON through
+    /setup — we never touch another platform's deliberate disable.
+    """
+    import yaml
+    config_path = Path(HERMES_HOME) / "config.yaml"
+    if not config_path.exists():
+        return
+    try:
+        with config_path.open() as f:
+            cfg = yaml.safe_load(f)
+    except (yaml.YAMLError, OSError):
+        return
+    if not isinstance(cfg, dict):
+        return
+    platforms = cfg.get("platforms")
+    block = platforms.get(platform_id) if isinstance(platforms, dict) else None
+    if not isinstance(block, dict) or block.get("enabled") is not False:
+        return
+    block.pop("enabled", None)
+    if not block:
+        platforms.pop(platform_id, None)
+    if not platforms:
+        cfg.pop("platforms", None)
+    try:
+        with config_path.open("w") as f:
+            yaml.safe_dump(cfg, f, sort_keys=False, default_flow_style=False)
+    except OSError as e:
+        print(f"[server] could not clear {platform_id} disable flag: {e!r}", flush=True)
+
+
+def _ensure_photon_sidecar_token(env: dict[str, str]) -> None:
+    """Pin a stable loopback token for the Photon sidecar.
+
+    The adapter otherwise mints a fresh ``secrets.token_hex(16)`` per gateway
+    process. That is fine for the gateway's own sends, but Photon's
+    standalone sender — the path any NON-gateway process takes, including the
+    `hermes dashboard` child this template also runs — refuses to send without
+    ``PHOTON_SIDECAR_TOKEN`` in the environment, because it has no way to learn
+    the gateway's private one. Persisting one value that build_hermes_env()
+    hands to every child makes both paths agree.
+    """
+    if env.get("PHOTON_PROJECT_ID") and not env.get("PHOTON_SIDECAR_TOKEN"):
+        env["PHOTON_SIDECAR_TOKEN"] = secrets.token_hex(16)
+
+
+async def _photon_store_credentials(project_id: str, secret: str, *, name: str, phone: str) -> None:
+    """Persist project creds to .env + auth.json, seeding access config once."""
+    auth = _read_auth_json()
+    auth.setdefault("credential_pool", {})["photon_project"] = [{
+        "spectrum_project_id": project_id,
+        "dashboard_project_id": project_id,   # unified upstream (dashboard ENG-1582)
+        "project_secret": secret,
+        "name": name,
+        "issued_at": int(time.time()),
+    }]
+    _write_auth_json(auth)
+
+    async with cfg_lock:
+        env = read_env(ENV_FILE)
+        env["PHOTON_PROJECT_ID"] = project_id
+        env["PHOTON_PROJECT_SECRET"] = secret
+        # Mirror the plugin's _autoconfigure_access: without an allowlist the
+        # gateway denies the operator's own first message, and without a home
+        # channel cron/notification delivery has nowhere to go. Only filled
+        # when unset so a hand-tuned allowlist survives a re-connect.
+        if phone:
+            env.setdefault("PHOTON_ALLOWED_USERS", phone)
+            env.setdefault("PHOTON_HOME_CHANNEL", phone)
+        _ensure_photon_sidecar_token(env)
+        write_env(ENV_FILE, env)
+        write_config_yaml(env)
+        _clear_platform_disable("photon")
+
+
+def _photon_store_numbers(*, phone: str, line: str, user_id: str, project_id: str) -> None:
+    if not phone and not line:
+        return
+    auth = _read_auth_json()
+    record: dict = {"issued_at": int(time.time())}
+    if phone:
+        record["phone_number"] = phone
+    if line:
+        record["assigned_phone_number"] = line
+    if user_id:
+        record["user_id"] = user_id
+    if project_id:
+        record["dashboard_project_id"] = project_id
+    auth.setdefault("credential_pool", {})["photon_user"] = [record]
+    _write_auth_json(auth)
+
+
+async def _photon_provision(state: dict, token: str) -> None:
+    """Post-login half of `hermes photon setup`: project → secret → user → line."""
+    client = get_http_client()
+    dash_host = _photon_host("dashboard")
+    spec_host = _photon_host("spectrum")
+    bearer = {"Authorization": f"Bearer {token}"}
+
+    auth = _read_auth_json()
+    auth.setdefault("credential_pool", {})["photon"] = [
+        {"access_token": token, "issued_at": int(time.time())}
+    ]
+    _write_auth_json(auth)
+
+    # 1. Find or create the project.
+    state["step"] = "Finding your Photon project…"
+    name = state.get("project_name") or _PHOTON_PROJECT_NAME
+    project_id = ""
+    resp = await client.get(f"{dash_host}/api/projects", headers=bearer, timeout=httpx.Timeout(30.0))
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Could not list Photon projects: {_photon_error_detail(resp)}")
+    for proj in _photon_unwrap_list(resp.json()):
+        if str(proj.get("name") or "").strip().lower() == name.strip().lower() and proj.get("id"):
+            project_id = str(proj["id"])
+            break
+    if not project_id:
+        state["step"] = f"Creating Photon project “{name}”…"
+        resp = await client.post(
+            f"{dash_host}/api/projects",
+            json={"name": name, "location": "United States", "template": False, "observability": False},
+            headers=bearer, timeout=httpx.Timeout(30.0),
+        )
+        if resp.status_code >= 400:
+            raise RuntimeError(f"Could not create a Photon project: {_photon_error_detail(resp)}")
+        created = resp.json() or {}
+        if created.get("error") or not created.get("id"):
+            raise RuntimeError(f"Photon create-project failed: {created.get('error') or 'no project id returned'}")
+        project_id = str(created["id"])
+    state["project_id"] = project_id
+
+    # 2. Mint a project secret. The dashboard reveals a secret exactly once, so
+    #    regenerate is the only way to READ one — persist it immediately.
+    state["step"] = "Provisioning Spectrum credentials…"
+    resp = await client.post(
+        f"{dash_host}/api/projects/{project_id}/regenerate-secret",
+        json={}, headers=bearer, timeout=httpx.Timeout(30.0),
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Could not mint a project secret: {_photon_error_detail(resp)}")
+    payload = resp.json() or {}
+    secret = str(payload.get("projectSecret") or "")
+    if not secret:
+        raise RuntimeError(f"Photon returned no project secret: {payload.get('error') or 'unexpected response'}")
+    await _photon_store_credentials(project_id, secret, name=name, phone=state.get("phone", ""))
+
+    # 3. Register the operator's number as a Spectrum user (idempotent), and
+    #    read back the line they text to reach the agent.
+    phone = state.get("phone", "")
+    line, user_id = "", ""
+    if phone:
+        state["step"] = "Registering your phone number…"
+        basic = _photon_basic(project_id, secret)
+        users_url = f"{spec_host}/projects/{project_id}/users/"
+        want = re.sub(r"[^\d+]", "", phone)
+        existing = None
+        resp = await client.get(users_url, headers=basic, timeout=httpx.Timeout(30.0))
+        if resp.status_code >= 400:
+            raise RuntimeError(f"Could not list Spectrum users: {_photon_error_detail(resp)}")
+        for user in _photon_unwrap_list(resp.json()):
+            if re.sub(r"[^\d+]", "", str(user.get("phoneNumber") or "")) == want:
+                existing = user
+                break
+        if existing is None:
+            resp = await client.post(
+                users_url, json={"type": "shared", "phoneNumber": phone},
+                headers=basic, timeout=httpx.Timeout(30.0),
+            )
+            if resp.status_code >= 400:
+                raise RuntimeError(f"Could not register {phone}: {_photon_error_detail(resp)}")
+            body = resp.json() or {}
+            if body.get("error"):
+                raise RuntimeError(f"Photon create-user failed: {body['error']}")
+            existing = body.get("user") or body.get("data") or body
+        if isinstance(existing, dict):
+            # `assignedPhoneNumber` is the dashboard's "TEXTS ON" column — the
+            # number to text, as opposed to the operator's own phoneNumber. On
+            # the free shared-line plan there is no /lines entry, so this
+            # per-user field is the source of truth.
+            line = str(existing.get("assignedPhoneNumber") or "")
+            user_id = str(existing.get("id") or "")
+
+    # 4. Fall back to the project's dedicated line inventory (paid plans).
+    if not line:
+        state["step"] = "Looking up your iMessage number…"
+        try:
+            resp = await client.get(
+                f"{dash_host}/api/projects/{project_id}/lines",
+                headers=bearer, timeout=httpx.Timeout(30.0),
+            )
+            lines = _photon_unwrap_list(resp.json()) if resp.status_code < 400 else []
+            for entry in lines:
+                if str(entry.get("platform") or "").lower() == "imessage":
+                    line = str(entry.get("phoneNumber") or "")
+                    break
+            if not line:
+                resp = await client.post(
+                    f"{dash_host}/api/projects/{project_id}/lines",
+                    json={"platform": "imessage"}, headers=bearer, timeout=httpx.Timeout(30.0),
+                )
+                if resp.status_code < 400:
+                    body = resp.json() or {}
+                    line = str((body.get("line") or body).get("phoneNumber") or "")
+        except Exception as e:
+            # Non-fatal: the channel works, we just can't show the number.
+            print(f"[photon] could not resolve the iMessage line: {e!r}", flush=True)
+
+    _photon_store_numbers(phone=phone, line=line, user_id=user_id, project_id=project_id)
+    state["imessage_line"] = line
+
+
+async def _poll_photon_device_auth(state: dict) -> None:
+    """Background task: poll Photon's device-token endpoint, then provision."""
+    client = get_http_client()
+    token = ""
+    while time.time() < state["expires_at"]:
+        await asyncio.sleep(state["interval"])
+        # A second "Connect" click replaces the global; the task started by the
+        # first one must stop rather than race a duplicate provisioning run
+        # against Photon (each of which rotates the project secret).
+        if _photon_state is not state:
+            return
+        try:
+            resp = await client.post(
+                f"{_photon_host('dashboard')}/api/auth/device/token",
+                json={
+                    "grant_type": _PHOTON_GRANT_TYPE,
+                    "device_code": state["device_code"],
+                    "client_id": _PHOTON_CLIENT_ID,
+                },
+                timeout=httpx.Timeout(30.0),
+            )
+        except Exception as e:
+            print(f"[photon] poll error: {e!r}", flush=True)
+            continue
+
+        if resp.status_code == 200:
+            token = _photon_token_from_response(resp)
+            if not token:
+                state["status"] = "error"
+                state["error"] = "Photon approved the login but returned no access token."
+                return
+            break
+        if resp.status_code == 429:
+            state["interval"] = min(state["interval"] + 10, 30)   # RFC 8628 §3.5
+            continue
+        if resp.status_code == 400:
+            try:
+                err = (resp.json() or {}).get("error") or (resp.json() or {}).get("message") or ""
+            except Exception:
+                err = ""
+            if err == "authorization_pending":
+                continue
+            if err == "slow_down":
+                state["interval"] = min(state["interval"] + 5, 30)
+                continue
+            state["status"] = "error"
+            state["error"] = f"Photon login failed: {err or 'unknown error'}"
+            print(f"[photon] device login failed: {err}", flush=True)
+            return
+        print(f"[photon] unexpected device-token status {resp.status_code}", flush=True)
+
+    if not token:
+        state["status"] = "expired"
+        print("[photon] device code expired", flush=True)
+        return
+
+    state["status"] = "provisioning"
+    try:
+        await _photon_provision(state, token)
+    except Exception as e:
+        state["status"] = "error"
+        state["error"] = str(e)
+        print(f"[photon] provisioning failed: {e!r}", flush=True)
+        return
+
+    state["status"] = "connected"
+    state["step"] = ""
+    print("[photon] connected — restarting gateway", flush=True)
+    # Both children only ever see the env they were spawned with, so the new
+    # PHOTON_* values need a respawn to reach them (same as api_config_put).
+    asyncio.create_task(gw.restart())
+    asyncio.create_task(dash.restart())
+
+
+async def api_photon_start(request: Request) -> Response:
+    global _photon_state
+    if err := guard(request):
+        return err
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    phone = str(body.get("phone", "")).strip().replace(" ", "").replace("-", "")
+    if phone and not _PHOTON_E164_RE.match(phone):
+        return JSONResponse(
+            {"error": "Phone number must be E.164 — a + followed by country code and number, e.g. +15551234567."},
+            status_code=400,
+        )
+    project_name = str(body.get("project_name", "")).strip() or _PHOTON_PROJECT_NAME
+
+    client = get_http_client()
+    try:
+        resp = await client.post(
+            f"{_photon_host('dashboard')}/api/auth/device/code",
+            json={"client_id": _PHOTON_CLIENT_ID, "scope": _PHOTON_SCOPE},
+            timeout=httpx.Timeout(30.0),
+        )
+    except Exception as e:
+        return JSONResponse({"error": f"Could not reach Photon: {e}"}, status_code=502)
+    if resp.status_code >= 400:
+        return JSONResponse({"error": f"Photon rejected the login request: {_photon_error_detail(resp)}"},
+                            status_code=502)
+    try:
+        data = resp.json()
+    except Exception:
+        return JSONResponse({"error": "Photon returned an unreadable device-code response."}, status_code=502)
+
+    _photon_state = {
+        "status": "pending",
+        "step": "Waiting for you to approve the login…",
+        "error": "",
+        "device_code": data["device_code"],
+        "interval": int(data.get("interval") or 5),
+        "expires_at": time.time() + int(data.get("expires_in") or 1800),
+        "phone": phone,
+        "project_name": project_name,
+        "project_id": "",
+        "imessage_line": "",
+    }
+    asyncio.create_task(_poll_photon_device_auth(_photon_state))
+    return JSONResponse({
+        "user_code": data["user_code"],
+        "verification_uri": data.get("verification_uri_complete") or data["verification_uri"],
+        "expires_in": int(data.get("expires_in") or 1800),
+    })
+
+
+async def api_photon_status(request: Request) -> Response:
+    if err := guard(request):
+        return err
+    project_id, secret = _photon_creds()
+    phone, line = _photon_stored_numbers()
+    out = {
+        "configured": bool(project_id and secret),
+        "project_id": project_id,
+        "phone": phone,
+        "imessage_line": line,
+        "sidecar_ready": _photon_sidecar_ready(),
+        "status": "none",
+        "step": "",
+        "error": "",
+    }
+    if _photon_state is not None:
+        out["status"] = _photon_state["status"]
+        out["step"] = _photon_state.get("step", "")
+        out["error"] = _photon_state.get("error", "")
+        out["imessage_line"] = _photon_state.get("imessage_line") or line
+    elif out["configured"]:
+        out["status"] = "connected"
+    return JSONResponse(out)
+
+
+async def api_photon_delete(request: Request) -> Response:
+    """Disconnect Photon — clear .env keys AND the auth.json credential pool.
+
+    Both halves matter: the plugin's load_project_credentials() falls back to
+    auth.json when the env vars are absent, so clearing only .env would leave
+    the platform silently enabled on the next gateway boot.
+    """
+    global _photon_state
+    if err := guard(request):
+        return err
+    async with cfg_lock:
+        env = read_env(ENV_FILE)
+        for key in ("PHOTON_PROJECT_ID", "PHOTON_PROJECT_SECRET",
+                    "PHOTON_ALLOWED_USERS", "PHOTON_HOME_CHANNEL",
+                    "PHOTON_REQUIRE_MENTION", "PHOTON_SIDECAR_TOKEN"):
+            env.pop(key, None)
+        write_env(ENV_FILE, env)
+    _photon_clear_auth_json()
+    _photon_state = None
+    # The dashboard child holds a frozen env snapshot, so without a respawn its
+    # own Channels page keeps reporting Photon as configured after a disconnect.
+    asyncio.create_task(gw.restart())
+    asyncio.create_task(dash.restart())
+    return JSONResponse({"ok": True})
+
+
+def _photon_clear_auth_json() -> None:
+    auth = _read_auth_json()
+    pool = auth.get("credential_pool")
+    if not isinstance(pool, dict):
+        return
+    changed = False
+    for key in ("photon", "photon_project", "photon_user"):
+        if pool.pop(key, None) is not None:
+            changed = True
+    if changed:
+        _write_auth_json(auth)
+
+
+# ── iMessage via BlueBubbles — public webhook relay ──────────────────────────
+# The BlueBubbles adapter binds an aiohttp listener on webhook_host:webhook_port
+# (default 127.0.0.1:8645) and registers THAT url with the BlueBubbles server
+# so the Mac can POST inbound iMessages to it. On Railway that never works
+# unaided: only $PORT is publicly routable and this Starlette app owns it, and
+# the adapter derives the registered URL from the same `webhook_host` it binds
+# to (gateway/platforms/bluebubbles.py:_webhook_url) — with `localhost`
+# substituted for any wildcard/loopback value. There is no "public URL"
+# setting to point at the edge, and binding the public hostname directly would
+# just fail at TCPSite.
+#
+# So we bridge it: hermes keeps its loopback listener, we expose ONE public
+# path that forwards to it, and we register the public URL with the
+# BlueBubbles server ourselves.
+#
+#   Mac (BlueBubbles)  ──POST https://<app>.up.railway.app/bluebubbles-webhook?password=…
+#                          │
+#                          ▼  (this relay — verifies ?password, forwards body)
+#                      http://127.0.0.1:8645/bluebubbles-webhook?password=…
+#                          │
+#                          ▼
+#                      hermes gateway's BlueBubbles adapter
+#
+# Auth is the same shared secret the adapter itself checks
+# (bluebubbles.py:_handle_webhook): the BlueBubbles webhook API cannot send
+# custom headers, so the server password rides in the query string. We verify
+# it at the edge with a constant-time compare BEFORE forwarding, so an
+# unauthenticated caller can never reach the gateway's listener.
+BLUEBUBBLES_RELAY_PATH   = "/bluebubbles-webhook"
+_BB_DEFAULT_WEBHOOK_PORT = 8645
+_BB_DEFAULT_WEBHOOK_PATH = "/bluebubbles-webhook"
+_BB_EVENTS               = ["new-message", "updated-message"]
+BLUEBUBBLES_MAX_WEBHOOK_BYTES = 2 * 1024 * 1024
+
+
+def _bb_loopback_url(env: dict[str, str]) -> str:
+    """Where hermes' own BlueBubbles listener is bound inside this container."""
+    try:
+        port = int(env.get("BLUEBUBBLES_WEBHOOK_PORT") or _BB_DEFAULT_WEBHOOK_PORT)
+    except ValueError:
+        port = _BB_DEFAULT_WEBHOOK_PORT
+    path = env.get("BLUEBUBBLES_WEBHOOK_PATH") or _BB_DEFAULT_WEBHOOK_PATH
+    if not path.startswith("/"):
+        path = f"/{path}"
+    return f"http://127.0.0.1:{port}{path}"
+
+
+def _public_base_url(request: Request, env: dict[str, str] | None = None) -> str:
+    """This deployment's externally reachable origin.
+
+    Derived from the request the admin's browser just made (so it is correct
+    on a custom domain, a Railway subdomain, or a local `docker run`) with the
+    proxy headers Railway's edge sets taking precedence. BLUEBUBBLES_PUBLIC_URL
+    overrides everything for setups behind a proxy that rewrites Host.
+    """
+    if env is None:
+        env = read_env(ENV_FILE)
+    override = (env.get("BLUEBUBBLES_PUBLIC_URL") or "").strip().rstrip("/")
+    if override:
+        return override if re.match(r"^https?://", override, re.I) else f"https://{override}"
+    proto = (request.headers.get("x-forwarded-proto", "").split(",")[0].strip()
+             or request.url.scheme or "https")
+    host = (request.headers.get("x-forwarded-host", "").split(",")[0].strip()
+            or request.headers.get("host", "")
+            or request.url.netloc
+            # Last resort for a request that arrived without a Host header —
+            # Railway injects this, and it's the domain it will always route.
+            or os.environ.get("RAILWAY_PUBLIC_DOMAIN", ""))
+    return f"{proto}://{host}"
+
+
+def _bb_relay_url(request: Request, env: dict[str, str], *, redact: bool = False) -> str:
+    password = env.get("BLUEBUBBLES_PASSWORD", "")
+    base = f"{_public_base_url(request, env)}{BLUEBUBBLES_RELAY_PATH}"
+    if not password:
+        return base
+    return f"{base}?password={'***' if redact else _url_quote(password, safe='')}"
+
+
+def _bb_api_url(server_url: str, password: str, path: str) -> str:
+    sep = "&" if "?" in path else "?"
+    return f"{server_url.rstrip('/')}{path}{sep}password={_url_quote(password, safe='')}"
+
+
+def _bb_config(env: dict[str, str] | None = None) -> tuple[str, str]:
+    if env is None:
+        env = read_env(ENV_FILE)
+    server_url = (env.get("BLUEBUBBLES_SERVER_URL") or "").strip().rstrip("/")
+    if server_url and not re.match(r"^https?://", server_url, re.I):
+        server_url = f"http://{server_url}"
+    return server_url, env.get("BLUEBUBBLES_PASSWORD", "")
+
+
+async def api_bluebubbles_webhook_relay(request: Request) -> Response:
+    """PUBLIC (no cookie) — forward a BlueBubbles webhook to the gateway.
+
+    Deliberately unauthenticated at the cookie layer: the caller is the user's
+    Mac, not a browser. It authenticates with the BlueBubbles server password
+    in the query string, which is exactly what the adapter's own handler
+    checks, so this relay is not a weaker gate than the endpoint it fronts.
+    """
+    env = read_env(ENV_FILE)
+    password = env.get("BLUEBUBBLES_PASSWORD", "")
+    if not password:
+        # Nothing configured — don't advertise that this path exists.
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+    supplied = (request.query_params.get("password")
+                or request.query_params.get("guid")
+                or request.headers.get("x-password")
+                or request.headers.get("x-guid")
+                or request.headers.get("x-bluebubbles-guid")
+                or "")
+    # Compare as bytes: compare_digest() raises TypeError on non-ASCII str
+    # inputs, and `supplied` is attacker-controlled — a single emoji in the
+    # query string would turn an auth failure into a 500.
+    if not _hmac.compare_digest(supplied.encode("utf-8"), password.encode("utf-8")):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    # Webhook events are small JSON documents — attachments are pulled
+    # separately by the adapter over REST, never inlined here. Cap the body so
+    # a misbehaving (or compromised) BlueBubbles server can't make us buffer an
+    # unbounded payload in a container sized for the agent, not for uploads.
+    try:
+        if int(request.headers.get("content-length") or 0) > BLUEBUBBLES_MAX_WEBHOOK_BYTES:
+            return JSONResponse({"error": "payload too large"}, status_code=413)
+    except ValueError:
+        return JSONResponse({"error": "bad content-length"}, status_code=400)
+
+    body = await request.body()
+    if len(body) > BLUEBUBBLES_MAX_WEBHOOK_BYTES:   # chunked / absent content-length
+        return JSONResponse({"error": "payload too large"}, status_code=413)
+    target = f"{_bb_loopback_url(env)}?password={_url_quote(password, safe='')}"
+    try:
+        resp = await get_http_client().post(
+            target,
+            content=body,
+            headers={"content-type": request.headers.get("content-type", "application/json")},
+            timeout=httpx.Timeout(30.0),
+        )
+    except httpx.HTTPError as e:
+        # Gateway stopped or still booting — tell BlueBubbles to retry later.
+        print(f"[bluebubbles-relay] gateway listener unreachable: {e!r}", flush=True)
+        return JSONResponse({"error": "gateway webhook listener unavailable"}, status_code=502)
+    return Response(
+        content=resp.content,
+        status_code=resp.status_code,
+        media_type=resp.headers.get("content-type"),
+    )
+
+
+async def _bb_list_webhooks(server_url: str, password: str) -> list[dict]:
+    resp = await get_http_client().get(
+        _bb_api_url(server_url, password, "/api/v1/webhook"), timeout=httpx.Timeout(15.0)
+    )
+    resp.raise_for_status()
+    data = resp.json().get("data")
+    return [w for w in data if isinstance(w, dict)] if isinstance(data, list) else []
+
+
+async def _bb_sync_webhook(desired_url: str, server_url: str, password: str) -> dict:
+    """Register *desired_url* with the BlueBubbles server, pruning stale relays.
+
+    Pruning is scoped to registrations that point at our relay path on a
+    NON-loopback host — i.e. a public URL from a previous domain or a rotated
+    password. hermes' own `http://localhost:8645/…` entry is deliberately left
+    alone: the adapter re-creates it on every connect and removes it on clean
+    shutdown, so deleting it here would just churn.
+    """
+    client = get_http_client()
+    existing = await _bb_list_webhooks(server_url, password)
+    already, removed = False, 0
+    for hook in existing:
+        url = str(hook.get("url") or "")
+        if url == desired_url:
+            already = True
+            continue
+        try:
+            parsed = _urlparse(url)
+            is_loopback = parsed.hostname in ("localhost", "127.0.0.1", "::1", None)
+        except ValueError:
+            continue        # unparseable entry from the server — not ours to touch
+        is_ours = parsed.path == BLUEBUBBLES_RELAY_PATH
+        if is_ours and not is_loopback and hook.get("id"):
+            try:
+                await client.delete(
+                    _bb_api_url(server_url, password, f"/api/v1/webhook/{hook['id']}"),
+                    timeout=httpx.Timeout(15.0),
+                )
+                removed += 1
+            except httpx.HTTPError:
+                pass
+    if already:
+        return {"registered": True, "created": False, "removed": removed}
+    resp = await client.post(
+        _bb_api_url(server_url, password, "/api/v1/webhook"),
+        json={"url": desired_url, "events": _BB_EVENTS},
+        timeout=httpx.Timeout(15.0),
+    )
+    resp.raise_for_status()
+    return {"registered": True, "created": True, "removed": removed}
+
+
+async def _bb_autoregister(desired_url: str, server_url: str, password: str) -> None:
+    """Best-effort webhook sync fired from a config save. Never raises."""
+    try:
+        result = await _bb_sync_webhook(desired_url, server_url, password)
+        if result.get("created"):
+            print("[bluebubbles] registered public webhook relay with the BlueBubbles server", flush=True)
+    except Exception as e:
+        print(f"[bluebubbles] webhook auto-registration failed: {e!r}", flush=True)
+
+
+async def api_bluebubbles_status(request: Request) -> Response:
+    if err := guard(request):
+        return err
+    env = read_env(ENV_FILE)
+    server_url, password = _bb_config(env)
+    out = {
+        "configured": bool(server_url and password),
+        "relay_url": _bb_relay_url(request, env, redact=True),
+        "reachable": False,
+        "private_api": False,
+        "helper_connected": False,
+        "webhook_registered": False,
+        "error": "",
+    }
+    if not out["configured"]:
+        return JSONResponse(out)
+
+    client = get_http_client()
+    try:
+        info = await client.get(
+            _bb_api_url(server_url, password, "/api/v1/server/info"), timeout=httpx.Timeout(15.0)
+        )
+        if info.status_code == 401:
+            out["error"] = "BlueBubbles rejected the password."
+            return JSONResponse(out)
+        info.raise_for_status()
+        data = (info.json() or {}).get("data") or {}
+        out["reachable"] = True
+        out["private_api"] = bool(data.get("private_api"))
+        out["helper_connected"] = bool(data.get("helper_connected"))
+    except httpx.HTTPError as e:
+        out["error"] = f"Could not reach the BlueBubbles server: {e}"
+        return JSONResponse(out)
+
+    desired = _bb_relay_url(request, env)
+    try:
+        out["webhook_registered"] = any(
+            str(w.get("url") or "") == desired for w in await _bb_list_webhooks(server_url, password)
+        )
+    except (httpx.HTTPError, ValueError) as e:
+        out["error"] = f"Could not read the server's webhook list: {e}"
+    return JSONResponse(out)
+
+
+async def api_bluebubbles_register(request: Request) -> Response:
+    if err := guard(request):
+        return err
+    env = read_env(ENV_FILE)
+    server_url, password = _bb_config(env)
+    if not (server_url and password):
+        return JSONResponse({"error": "Set the BlueBubbles server URL and password first."}, status_code=400)
+    try:
+        result = await _bb_sync_webhook(_bb_relay_url(request, env), server_url, password)
+    except httpx.HTTPError as e:
+        return JSONResponse({"error": f"BlueBubbles rejected the webhook registration: {e}"}, status_code=502)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+    return JSONResponse({"ok": True, "relay_url": _bb_relay_url(request, env, redact=True), **result})
+
+
 def is_config_complete(data: dict[str, str] | None = None) -> bool:
     """Single source of truth for 'ready to run the gateway'.
 
@@ -779,16 +1737,18 @@ def unmask(new: dict[str, str], existing: dict[str, str]) -> dict[str, str]:
 #
 # The SECRET is regenerated on every process start. That means any ADMIN_PASSWORD
 # change via Railway → redeploy → all existing cookies invalidate → users re-login.
-import hashlib as _hashlib
-import hmac as _hmac
-from urllib.parse import quote as _url_quote, urlparse as _urlparse
+# (_hmac / _hashlib / _url_quote / _urlparse are imported at the top of the
+# module — the iMessage relay above needs them too.)
 
 COOKIE_NAME = "hermes_auth"
 COOKIE_MAX_AGE = 7 * 86400  # 7 days
 COOKIE_SECRET = secrets.token_bytes(32)
 
-# Public paths — no auth required. Everything else is behind the cookie gate.
-PUBLIC_PATHS = {"/health", "/login", "/logout"}
+# Inventory of the paths that do NOT call guard(). Documentation only — auth is
+# enforced per-handler, not from this set — so keep it in sync when adding a
+# route. The BlueBubbles relay is public because its caller is the user's Mac,
+# not a browser; it carries its own shared-secret check instead.
+PUBLIC_PATHS = {"/health", "/login", "/logout", BLUEBUBBLES_RELAY_PATH}
 
 
 def _make_auth_token() -> str:
@@ -1379,8 +2339,16 @@ async def api_config_put(request: Request):
             for k, v in existing.items():
                 if k not in merged:
                     merged[k] = v
+            _ensure_photon_sidecar_token(merged)
             write_env(ENV_FILE, merged)
             write_config_yaml(merged)
+            # Saving a fully-configured iMessage channel from this page is an
+            # explicit "turn it on", so lift a sticky disable left by the
+            # Hermes dashboard's own Channels toggle.
+            for _platform, _keys in (("photon", ("PHOTON_PROJECT_ID", "PHOTON_PROJECT_SECRET")),
+                                     ("bluebubbles", ("BLUEBUBBLES_SERVER_URL", "BLUEBUBBLES_PASSWORD"))):
+                if all(merged.get(k) for k in _keys):
+                    _clear_platform_disable(_platform)
 
         model_warning = None
         hermes_provider_id = HERMES_PROVIDER_IDS.get(active_provider_key)
@@ -1396,6 +2364,20 @@ async def api_config_put(request: Request):
                 pin_api_key = merged.get(active_provider_key, "").strip()
             model_warning = await set_active_model_via_hermes(
                 hermes_provider_id, model_value, base_url=pin_base_url, api_key=pin_api_key
+            )
+
+        # Keep the BlueBubbles server's webhook list pointing at THIS
+        # deployment's public relay. Fired on every save rather than only on a
+        # change because the public origin can move underneath a config that
+        # never changed (a new Railway subdomain, a custom domain added later)
+        # — and a stale registration is silently fatal: the Mac keeps POSTing
+        # to a host that no longer routes here and inbound iMessages just stop.
+        # Best-effort and detached, so a BlueBubbles server that's asleep or
+        # off-network never blocks or fails the save.
+        bb_server_url, bb_password = _bb_config(merged)
+        if bb_server_url and bb_password:
+            asyncio.create_task(
+                _bb_autoregister(_bb_relay_url(request, merged), bb_server_url, bb_password)
             )
 
         if restart:
@@ -1420,9 +2402,13 @@ async def api_status(request: Request):
         {"configured": bool(data.get(k))}
         for k in PROVIDER_KEYS
     }
+    def _channel_set(key: str) -> bool:
+        v = data.get(key, "")
+        return bool(v) and v.lower() not in ("false", "0", "no")
+
     channels = {
-        name: {"configured": bool(v := data.get(key,"")) and v.lower() not in ("false","0","no")}
-        for name, key in CHANNEL_MAP.items()
+        name: {"configured": all(_channel_set(k) for k in ((keys,) if isinstance(keys, str) else keys))}
+        for name, keys in CHANNEL_MAP.items()
     }
     return JSONResponse({"gateway": gw.status(), "providers": providers, "channels": channels})
 
@@ -1452,11 +2438,18 @@ async def api_gw_restart(request: Request):
 
 async def api_config_reset(request: Request):
     if err := guard(request): return err
+    global _photon_state
     asyncio.create_task(gw.stop())
     async with cfg_lock:
         if ENV_FILE.exists():
             ENV_FILE.unlink()
         write_config_yaml({}, reset_model=True)
+    # Deleting .env is not enough for Photon: the plugin's own
+    # load_project_credentials() falls back to auth.json's credential_pool, so
+    # a reset that touched only .env would leave the iMessage channel silently
+    # live on the next gateway boot — with credentials the UI no longer shows.
+    _photon_clear_auth_json()
+    _photon_state = None
     return JSONResponse({"ok": True})
 
 
@@ -2106,6 +3099,10 @@ routes = [
     Route("/login",                             page_login,          methods=["GET"]),
     Route("/login",                             login_post,          methods=["POST"]),
     Route("/logout",                            logout),
+    # Inbound iMessage webhooks from the user's BlueBubbles Mac. Public by
+    # necessity (the caller is not a browser and holds no cookie) but gated on
+    # the BlueBubbles server password — see api_bluebubbles_webhook_relay.
+    Route(BLUEBUBBLES_RELAY_PATH,               api_bluebubbles_webhook_relay, methods=["POST"]),
 
     # Our setup wizard + management API, all under /setup/* (cookie-auth guarded).
     Route("/setup",                             page_index),
@@ -2126,6 +3123,12 @@ routes = [
     Route("/setup/api/oauth/xai/start",         api_oauth_xai_start,  methods=["POST"]),
     Route("/setup/api/oauth/xai/status",        api_oauth_xai_status),
     Route("/setup/api/oauth/xai",               api_oauth_xai_delete, methods=["DELETE"]),
+    # iMessage — Photon device login + BlueBubbles webhook management.
+    Route("/setup/api/photon/start",            api_photon_start,     methods=["POST"]),
+    Route("/setup/api/photon/status",           api_photon_status),
+    Route("/setup/api/photon",                  api_photon_delete,    methods=["DELETE"]),
+    Route("/setup/api/bluebubbles/status",      api_bluebubbles_status),
+    Route("/setup/api/bluebubbles/register",    api_bluebubbles_register, methods=["POST"]),
     Route("/setup/api/backup/download",         api_backup_download),
     Route("/setup/api/backup/restore",          api_backup_restore,  methods=["POST"]),
     Route("/setup/api/backup/snapshots",        api_backup_snapshots),

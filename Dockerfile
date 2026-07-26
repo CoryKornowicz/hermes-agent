@@ -21,8 +21,16 @@ ARG HERMES_REF=v2026.7.1
 #
 # Node.js is required only at build time to compile the Hermes React dashboard.
 # We strip the source + apt lists afterwards to keep the image lean.
+#
+# lsof + procps exist for the Photon iMessage sidecar. Its adapter reclaims its
+# loopback port from an orphaned sidecar before spawning a new one, and it does
+# that by shelling out to `lsof -ti tcp:<port>` and `ps -p <pid> -o command=`
+# to confirm the squatter really is a sidecar before signalling it. Both calls
+# swallow OSError and return "nothing found", so on a slim image without them
+# the reaper silently no-ops and every reconnect after a hard gateway kill dies
+# on EADDRINUSE — iMessage stays down until the container is redeployed.
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl ca-certificates git tini && \
+    apt-get install -y --no-install-recommends curl ca-certificates git tini lsof procps && \
     curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     apt-get install -y --no-install-recommends nodejs && \
     rm -rf /var/lib/apt/lists/*
@@ -48,7 +56,31 @@ RUN git clone --depth 1 --branch ${HERMES_REF} https://github.com/NousResearch/h
     cd /opt/hermes-agent/ui-tui && \
     npm install --silent --no-fund --no-audit --progress=false && \
     npm run build && \
+    cd /opt/hermes-agent/plugins/platforms/photon/sidecar && \
+    npm ci --silent --no-fund --no-audit --progress=false && \
     rm -rf /opt/hermes-agent/web /opt/hermes-agent/.git /root/.npm
+
+# Why pre-install the Photon sidecar (iMessage):
+# - The bundled `photon-platform` plugin is how this template does iMessage
+#   without a Mac. Its adapter bridges to Photon's Spectrum cloud through a
+#   Node process running the TypeScript-only `spectrum-ts` SDK, and its
+#   check_requirements() hard-fails when `sidecar/node_modules` is missing —
+#   so without this step the channel simply never connects.
+# - `npm ci` (not `npm install`) installs the committed lockfile verbatim.
+#   `spectrum-ts` is pinned to an exact version upstream precisely because the
+#   SDK ships breaking majors; a floating resolve could brick the channel on a
+#   rebuild. `ci` also runs the plugin's `postinstall` patch, which rewrites
+#   the SDK's compiled iMessage inbound mappers so a bubble carrying both text
+#   and an attachment keeps its typed text — it fails loudly if the upstream
+#   build no longer matches, surfacing here at build time rather than as
+#   silently dropped message text at runtime.
+# - Runtime installation is not an option: /opt is baked into the image, so
+#   anything installed there at runtime is lost on the next redeploy.
+# - Node itself must therefore survive into the final image (the adapter
+#   spawns `node sidecar/index.mjs`) — which it does; only the npm cache and
+#   the React dashboard sources are stripped above.
+# - When bumping HERMES_REF, re-check plugins/platforms/photon/sidecar/
+#   package.json still exists at that path.
 
 # Why pre-build ui-tui (and why we don't delete it after):
 # - The dashboard's embedded Chat tab spawns `node ui-tui/dist/entry.js`

@@ -448,6 +448,8 @@
   }
   .chip.green { background: rgba(63,185,80,0.15);  color: var(--green); }
   .chip.dim   { background: rgba(255,255,255,0.04); color: var(--text-dim); }
+  .chip.yellow{ background: rgba(210,153,34,0.15); color: var(--yellow); }
+  .chip.red   { background: rgba(248,81,73,0.15);  color: var(--red); }
 
   /* ── Table ────────────────────────────────────────── */
   .data-table { width: 100%; border-collapse: collapse; }
@@ -1171,6 +1173,176 @@
             </div>
           </div>
 
+          <!-- iMessage via Photon — managed line, no Mac, no public URL -->
+          <div class="toggle-row" @click="togglePhoton(!channelsEnabled.photon)">
+            <input type="checkbox" :checked="channelsEnabled.photon" @click.stop @change="togglePhoton($event.target.checked)">
+            <span class="toggle-icon">📱</span>
+            <span class="toggle-label">iMessage</span>
+            <span class="chip dim">Photon</span>
+            <span class="chip green" x-show="photon.status==='connected'">✓ connected</span>
+            <span style="font-size:11px;color:var(--text-dim);margin-left:4px;" x-show="photon.status!=='connected'">no Mac needed</span>
+          </div>
+          <div class="toggle-body" x-show="channelsEnabled.photon">
+
+            <p class="hint" style="margin:0 0 12px;">
+              <a href="https://photon.codes/" target="_blank" style="color:var(--accent2);">Photon</a>
+              hosts the iMessage line for you, so this works on Railway with nothing else to run —
+              no always-on Mac and no inbound webhook. Connect below and you'll get a number to text.
+            </p>
+
+            <!-- Sidecar precondition: the adapter refuses to connect without it. -->
+            <div x-show="photon.sidecarReady === false"
+                 style="border-left:3px solid var(--yellow);background:rgba(210,153,34,.07);padding:10px 12px;border-radius:6px;margin-bottom:12px;">
+              <p style="font-size:12px;color:var(--yellow);margin:0;">
+                The Photon Node sidecar isn't installed in this image, so the gateway can't connect.
+                Rebuild from the current <code>Dockerfile</code> (it runs <code>npm ci</code> for the
+                sidecar at build time) and redeploy.
+              </p>
+            </div>
+
+            <!-- not connected -->
+            <template x-if="photon.status !== 'connected' && photon.status !== 'pending' && photon.status !== 'provisioning'">
+              <div>
+                <div>
+                  <label class="field-label">Your iMessage phone number</label>
+                  <input type="text" x-model="photon.connectPhone" placeholder="+15551234567">
+                  <p class="hint">E.164 format. Gets allowlisted so your own texts reach the agent, and becomes the default target for scheduled messages.</p>
+                </div>
+                <button class="btn primary" style="width:100%;margin-top:12px;"
+                        @click="startPhoton()" :disabled="photon.loading || !photon.connectPhone">
+                  <span x-show="!photon.loading">Connect Photon</span>
+                  <span x-show="photon.loading">Starting…</span>
+                </button>
+                <p x-show="photon.error" x-text="photon.error" style="color:var(--red);margin:8px 0 0;font-size:12px;"></p>
+              </div>
+            </template>
+
+            <!-- awaiting approval / provisioning -->
+            <template x-if="photon.status === 'pending' || photon.status === 'provisioning'">
+              <div>
+                <template x-if="photon.status === 'pending'">
+                  <div>
+                    <p class="hint" style="margin:0 0 8px;">A new tab opened. Approve the login on the Photon page with the code below, then come back here.</p>
+                    <a :href="photon.verificationUri" target="_blank"
+                       style="display:block;color:var(--accent2);font-size:12px;word-break:break-all;margin-bottom:10px;"
+                       x-text="photon.verificationUri"></a>
+                    <div style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:14px;text-align:center;margin-bottom:10px;">
+                      <span style="font-family:var(--font-mono);font-size:26px;letter-spacing:5px;color:#c9d1d9;" x-text="photon.userCode"></span>
+                    </div>
+                  </div>
+                </template>
+                <p class="hint" style="text-align:center;margin:0;">
+                  ⏳ <span x-text="photon.step || 'Waiting for authorisation…'"></span>
+                </p>
+              </div>
+            </template>
+
+            <!-- connected -->
+            <template x-if="photon.status === 'connected'">
+              <div>
+                <div x-show="photon.line"
+                     style="background:rgba(63,185,80,.08);border:1px solid rgba(63,185,80,.25);border-radius:6px;padding:14px;text-align:center;margin-bottom:12px;">
+                  <p class="hint" style="margin:0 0 6px;">Text this number to talk to your agent</p>
+                  <span style="font-family:var(--font-mono);font-size:20px;color:var(--green);" x-text="photon.line"></span>
+                </div>
+                <p x-show="!photon.line" class="hint" style="margin:0 0 12px;">
+                  Connected, but Photon hasn't assigned an iMessage line yet — check
+                  <a href="https://app.photon.codes/" target="_blank" style="color:var(--accent2);">app.photon.codes</a>.
+                </p>
+                <div class="field-grid-2">
+                  <div>
+                    <label class="field-label">Allowed Numbers</label>
+                    <input type="text" :value="vars.PHOTON_ALLOWED_USERS||''" @input="vars.PHOTON_ALLOWED_USERS=$event.target.value" placeholder="+15551234567,+15559876543">
+                    <p class="hint">Comma-separated E.164. Anyone else texting in raises a pairing request under <strong>Users</strong>.</p>
+                  </div>
+                  <div>
+                    <label class="field-label">Home Channel</label>
+                    <input type="text" :value="vars.PHOTON_HOME_CHANNEL||''" @input="vars.PHOTON_HOME_CHANNEL=$event.target.value" placeholder="+15551234567">
+                    <p class="hint">Where scheduled/proactive messages go.</p>
+                  </div>
+                </div>
+                <label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text-dim);cursor:pointer;margin-top:12px;">
+                  <input type="checkbox" :checked="vars.PHOTON_REQUIRE_MENTION==='true'"
+                         @change="vars.PHOTON_REQUIRE_MENTION=$event.target.checked?'true':'false'">
+                  Only respond in group chats when "hermes" is mentioned
+                </label>
+                <div style="display:flex;gap:8px;align-items:center;margin-top:12px;">
+                  <span class="hint" style="flex:1;">Project <code x-text="photon.projectId"></code></span>
+                  <button class="btn sm danger" @click="disconnectPhoton()">Disconnect</button>
+                </div>
+              </div>
+            </template>
+          </div>
+
+          <!-- iMessage via BlueBubbles — bring your own Mac -->
+          <div class="toggle-row" @click="channelsEnabled.bluebubbles=!channelsEnabled.bluebubbles; if(!channelsEnabled.bluebubbles) clearChannel('bluebubbles')">
+            <input type="checkbox" :checked="channelsEnabled.bluebubbles" @click.stop @change="channelsEnabled.bluebubbles=$event.target.checked; if(!channelsEnabled.bluebubbles) clearChannel('bluebubbles')">
+            <span class="toggle-icon">🍎</span>
+            <span class="toggle-label">iMessage</span>
+            <span class="chip dim">BlueBubbles</span>
+            <span style="font-size:11px;color:var(--text-dim);margin-left:4px;">your own Mac</span>
+          </div>
+          <div class="toggle-body" x-show="channelsEnabled.bluebubbles">
+            <p class="hint" style="margin:0 0 12px;">
+              Bridges to a <a href="https://bluebubbles.app/" target="_blank" style="color:var(--accent2);">BlueBubbles</a>
+              server running on an always-on Mac signed into iMessage. The Mac must be able to reach
+              this deployment and vice-versa — expose it with Ngrok, a Cloudflare tunnel, or dynamic DNS.
+            </p>
+            <div class="field-grid-2">
+              <div>
+                <label class="field-label">Server URL</label>
+                <input type="text" :value="vars.BLUEBUBBLES_SERVER_URL||''" @input="vars.BLUEBUBBLES_SERVER_URL=$event.target.value" placeholder="https://imessage.example.com">
+              </div>
+              <div>
+                <label class="field-label">Server Password</label>
+                <input type="password" :value="vars.BLUEBUBBLES_PASSWORD||''" @input="vars.BLUEBUBBLES_PASSWORD=$event.target.value">
+                <p class="hint">BlueBubbles Server → Settings → API</p>
+              </div>
+              <div>
+                <label class="field-label">Allowed Handles</label>
+                <input type="text" :value="vars.BLUEBUBBLES_ALLOWED_USERS||''" @input="vars.BLUEBUBBLES_ALLOWED_USERS=$event.target.value" placeholder="+15551234567,me@icloud.com">
+                <p class="hint">Leave blank to approve senders under <strong>Users</strong> instead.</p>
+              </div>
+              <div>
+                <label class="field-label">Home Chat</label>
+                <input type="text" :value="vars.BLUEBUBBLES_HOME_CHANNEL||''" @input="vars.BLUEBUBBLES_HOME_CHANNEL=$event.target.value" placeholder="+15551234567">
+                <p class="hint">Where scheduled/proactive messages go.</p>
+              </div>
+            </div>
+
+            <!-- Inbound webhook relay. Railway exposes one port, and the gateway's
+                 own BlueBubbles listener is loopback-only, so inbound iMessages
+                 arrive through this app and get forwarded internally. -->
+            <div style="border-left:3px solid var(--accent);background:rgba(88,110,255,.06);padding:12px 14px;border-radius:6px;margin-top:14px;">
+              <p style="font-size:12px;font-weight:600;color:#c9d1d9;margin:0 0 6px;">Inbound webhook</p>
+              <p class="hint" style="margin:0 0 8px;">
+                Your Mac posts incoming iMessages to this deployment, which forwards them to the gateway.
+                Saving registers it automatically — use the button if you changed domains or rotated the password.
+              </p>
+              <code style="display:block;font-size:11px;color:var(--text-dim);word-break:break-all;margin-bottom:10px;"
+                    x-text="bb.status ? bb.status.relay_url : '—'"></code>
+              <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+                <button class="btn sm" @click="registerBbWebhook()" :disabled="bb.loading">
+                  <span x-show="!bb.loading">Register webhook</span>
+                  <span x-show="bb.loading">Working…</span>
+                </button>
+                <button class="btn sm" @click="loadBbStatus()" :disabled="bb.checking">Test connection</button>
+                <template x-if="bb.status && bb.status.configured">
+                  <span style="display:flex;gap:6px;align-items:center;">
+                    <span class="chip" :class="bb.status.reachable?'green':'red'"
+                          x-text="bb.status.reachable?'server reachable':'unreachable'"></span>
+                    <span class="chip" :class="bb.status.webhook_registered?'green':'yellow'"
+                          x-text="bb.status.webhook_registered?'webhook registered':'webhook not registered'"></span>
+                    <span class="chip" :class="bb.status.private_api?'green':'dim'"
+                          x-text="bb.status.private_api?'private API':'no private API'"></span>
+                  </span>
+                </template>
+              </div>
+              <p x-show="bb.error" x-text="bb.error" style="color:var(--red);margin:8px 0 0;font-size:12px;"></p>
+              <p x-show="bb.status && bb.status.error" x-text="bb.status && bb.status.error" style="color:var(--red);margin:8px 0 0;font-size:12px;"></p>
+            </div>
+          </div>
+
           <!-- Email -->
           <div class="toggle-row" @click="channelsEnabled.email=!channelsEnabled.email; if(!channelsEnabled.email) clearChannel('email')">
             <input type="checkbox" :checked="channelsEnabled.email" @click.stop @change="channelsEnabled.email=$event.target.checked; if(!channelsEnabled.email) clearChannel('email')">
@@ -1693,11 +1865,24 @@ function app() {
 
     xai: { loading: false, userCode: '', verificationUri: '', status: 'none', error: '' },
 
+    // iMessage via the bundled photon-platform plugin. `status` mirrors the
+    // server's flow state: none → pending (awaiting device approval) →
+    // provisioning (project/secret/number) → connected.
+    photon: {
+      loading: false, userCode: '', verificationUri: '', status: 'none', step: '',
+      error: '', projectId: '', phone: '', line: '', sidecarReady: true,
+      connectPhone: '', poll: null,
+    },
+
+    // iMessage via a self-hosted BlueBubbles server.
+    bb: { loading: false, checking: false, status: null, error: '' },
+
     selectedProvider: '',
 
     channelsEnabled: {
       telegram: false, discord: false, slack: false,
       email: false, mattermost: false, matrix: false, whatsapp: false,
+      photon: false, bluebubbles: false,
     },
 
     toolsEnabled: Object.fromEntries(tools.map(t => [t.key, false])),
@@ -1784,6 +1969,10 @@ function app() {
         mattermost: ['MATTERMOST_URL','MATTERMOST_TOKEN'],
         matrix:     ['MATRIX_HOMESERVER','MATRIX_ACCESS_TOKEN','MATRIX_USER_ID'],
         whatsapp:   ['WHATSAPP_ENABLED'],
+        // Photon is deliberately absent: its credentials also live in
+        // auth.json, so blanking vars alone would leave the channel enabled on
+        // the next gateway boot. Use disconnectPhoton() (DELETE) instead.
+        bluebubbles: ['BLUEBUBBLES_SERVER_URL','BLUEBUBBLES_PASSWORD','BLUEBUBBLES_ALLOWED_USERS','BLUEBUBBLES_HOME_CHANNEL'],
       };
       for (const k of keysMap[ch] || []) this.vars[k] = '';
     },
@@ -1823,6 +2012,105 @@ function app() {
       this.xai.loading = false;
     },
 
+    // ── iMessage via Photon ────────────────────────────────────────────────
+    applyPhotonStatus(s) {
+      if (!s) return;
+      this.photon.status       = s.status || 'none';
+      this.photon.step         = s.step   || '';
+      this.photon.projectId    = s.project_id || '';
+      this.photon.line         = s.imessage_line || '';
+      this.photon.sidecarReady = s.sidecar_ready !== false;
+      if (s.error) this.photon.error = s.error;
+      if (s.phone && !this.photon.connectPhone) this.photon.connectPhone = s.phone;
+    },
+
+    async loadPhotonStatus() {
+      try {
+        const r = await fetch('/setup/api/photon/status');
+        if (r.ok) this.applyPhotonStatus(await r.json());
+      } catch {}
+    },
+
+    async startPhoton() {
+      this.photon.loading = true;
+      this.photon.error = '';
+      try {
+        const r = await fetch('/setup/api/photon/start', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ phone: this.photon.connectPhone }),
+        });
+        const d = await r.json();
+        if (!r.ok) { this.photon.error = d.error || 'Could not start the Photon login'; this.photon.loading = false; return; }
+        this.photon.userCode = d.user_code;
+        this.photon.verificationUri = d.verification_uri;
+        this.photon.status = 'pending';
+        this.photon.step = 'Waiting for you to approve the login…';
+        window.open(d.verification_uri, '_blank');
+        if (this.photon.poll) clearInterval(this.photon.poll);
+        this.photon.poll = setInterval(async () => {
+          const s = await fetch('/setup/api/photon/status').then(r2 => r2.json()).catch(() => null);
+          if (!s) return;
+          this.applyPhotonStatus(s);
+          if (s.status === 'connected') {
+            clearInterval(this.photon.poll); this.photon.poll = null;
+            await this.loadConfig();
+            this.notify('iMessage connected via Photon', true);
+          } else if (s.status === 'error' || s.status === 'expired') {
+            clearInterval(this.photon.poll); this.photon.poll = null;
+            this.photon.error = s.error || 'Authorisation failed or expired';
+          }
+        }, 3000);
+      } catch (e) { this.photon.error = 'Network error: ' + e.message; }
+      this.photon.loading = false;
+    },
+
+    async disconnectPhoton() {
+      if (!confirm('Disconnect Photon? This removes the iMessage credentials from this deployment.')) return false;
+      if (this.photon.poll) { clearInterval(this.photon.poll); this.photon.poll = null; }
+      try {
+        await fetch('/setup/api/photon', { method: 'DELETE' });
+      } catch (e) { this.notify('Disconnect failed: ' + e.message, false); return false; }
+      Object.assign(this.photon, { status: 'none', step: '', error: '', projectId: '', line: '', userCode: '', verificationUri: '' });
+      await this.loadConfig();
+      this.notify('Photon disconnected', true);
+      return true;
+    },
+
+    // Unchecking a connected Photon must go through the DELETE endpoint —
+    // blanking vars alone leaves credentials in auth.json and the channel live.
+    async togglePhoton(on) {
+      if (on) { this.channelsEnabled.photon = true; return; }
+      if (this.photon.status === 'connected' || this.photon.projectId) {
+        if (!await this.disconnectPhoton()) return;
+      }
+      this.channelsEnabled.photon = false;
+    },
+
+    // ── iMessage via BlueBubbles ───────────────────────────────────────────
+    async loadBbStatus() {
+      this.bb.checking = true;
+      this.bb.error = '';
+      try {
+        const r = await fetch('/setup/api/bluebubbles/status');
+        if (r.ok) this.bb.status = await r.json();
+      } catch (e) { this.bb.error = 'Network error: ' + e.message; }
+      this.bb.checking = false;
+    },
+
+    async registerBbWebhook() {
+      this.bb.loading = true;
+      this.bb.error = '';
+      try {
+        const r = await fetch('/setup/api/bluebubbles/register', { method: 'POST' });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) { this.bb.error = d.error || 'Registration failed'; }
+        else { this.notify(d.created ? 'Webhook registered' : 'Webhook already registered', true); }
+      } catch (e) { this.bb.error = 'Network error: ' + e.message; }
+      this.bb.loading = false;
+      await this.loadBbStatus();
+    },
+
     async init() {
       await Promise.all([this.loadConfig(), this.loadStatus(), this.loadLogs(), this.loadPairing(), this.loadSnapshots()]);
       setInterval(() => this.loadStatus(),  5000);
@@ -1839,6 +2127,9 @@ function app() {
           // Refresh xAI OAuth status (drives configuredProviders computed getter).
           const xs = await fetch('/setup/api/oauth/xai/status').then(r2 => r2.json()).catch(() => ({ status: 'none' }));
           this.xai.status = xs.status;
+          // Photon's connected state lives in auth.json as well as .env, so it
+          // has its own endpoint rather than being inferred from vars alone.
+          await this.loadPhotonStatus();
           // Detect active channels
           this.channelsEnabled = {
             telegram:   !!(this.vars.TELEGRAM_BOT_TOKEN),
@@ -1848,7 +2139,10 @@ function app() {
             mattermost: !!(this.vars.MATTERMOST_URL),
             matrix:     !!(this.vars.MATRIX_HOMESERVER),
             whatsapp:   this.vars.WHATSAPP_ENABLED === 'true',
+            photon:     !!(this.vars.PHOTON_PROJECT_ID),
+            bluebubbles:!!(this.vars.BLUEBUBBLES_SERVER_URL),
           };
+          if (this.channelsEnabled.bluebubbles) this.loadBbStatus();
           // Detect active tools
           for (const t of this.tools) {
             this.toolsEnabled[t.key] = !!(this.vars[t.key]);
