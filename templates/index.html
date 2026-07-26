@@ -1244,6 +1244,22 @@
                      style="background:rgba(63,185,80,.08);border:1px solid rgba(63,185,80,.25);border-radius:6px;padding:14px;text-align:center;margin-bottom:12px;">
                   <p class="hint" style="margin:0 0 6px;">Text this number to talk to your agent</p>
                   <span style="font-family:var(--font-mono);font-size:20px;color:var(--green);" x-text="photon.line"></span>
+                  <div style="margin-top:10px;">
+                    <button class="btn sm" @click="recheckPhotonLine()" :disabled="photon.rechecking">
+                      <span x-show="!photon.rechecking">Recheck number</span>
+                      <span x-show="photon.rechecking">Checking…</span>
+                    </button>
+                  </div>
+                </div>
+                <!-- On the free shared-line tier the assignment belongs to
+                     Photon, so a change is something the user must be told
+                     about rather than left to discover via silence. -->
+                <div x-show="photon.lineChanged"
+                     style="border-left:3px solid var(--yellow);background:rgba(210,153,34,.07);padding:10px 12px;border-radius:6px;margin-bottom:12px;">
+                  <p style="font-size:12px;color:var(--yellow);margin:0;">
+                    Photon moved you to a new iMessage line. Text the number above from now on —
+                    replies to the old one won't reach your agent.
+                  </p>
                 </div>
                 <p x-show="!photon.line" class="hint" style="margin:0 0 12px;">
                   Connected, but Photon hasn't assigned an iMessage line yet — check
@@ -1871,7 +1887,7 @@ function app() {
     photon: {
       loading: false, userCode: '', verificationUri: '', status: 'none', step: '',
       error: '', projectId: '', phone: '', line: '', sidecarReady: true,
-      connectPhone: '', poll: null,
+      connectPhone: '', poll: null, rechecking: false, lineChanged: false,
     },
 
     // iMessage via a self-hosted BlueBubbles server.
@@ -2024,11 +2040,27 @@ function app() {
       if (s.phone && !this.photon.connectPhone) this.photon.connectPhone = s.phone;
     },
 
-    async loadPhotonStatus() {
+    // refresh=true asks the server to re-read the assigned line from Photon.
+    // Sent on page load and from Recheck, never from the connect poll loop.
+    async loadPhotonStatus(refresh = false) {
       try {
-        const r = await fetch('/setup/api/photon/status');
-        if (r.ok) this.applyPhotonStatus(await r.json());
+        const r = await fetch('/setup/api/photon/status' + (refresh ? '?refresh=1' : ''));
+        if (r.ok) {
+          const s = await r.json();
+          this.applyPhotonStatus(s);
+          if (s.line_changed) this.photon.lineChanged = true;
+        }
       } catch {}
+    },
+
+    async recheckPhotonLine() {
+      this.photon.rechecking = true;
+      this.photon.lineChanged = false;
+      const before = this.photon.line;
+      await this.loadPhotonStatus(true);
+      this.photon.rechecking = false;
+      this.notify(this.photon.line === before
+        ? 'Still the same number' : `Number is now ${this.photon.line}`, true);
     },
 
     async startPhoton() {
@@ -2129,7 +2161,9 @@ function app() {
           this.xai.status = xs.status;
           // Photon's connected state lives in auth.json as well as .env, so it
           // has its own endpoint rather than being inferred from vars alone.
-          await this.loadPhotonStatus();
+          // refresh=true: the shared-line assignment is Photon's to change, so
+          // re-read it on load rather than trusting the connect-time cache.
+          await this.loadPhotonStatus(true);
           // Detect active channels
           this.channelsEnabled = {
             telegram:   !!(this.vars.TELEGRAM_BOT_TOKEN),
