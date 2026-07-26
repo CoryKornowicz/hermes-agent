@@ -1362,10 +1362,78 @@ async def api_photon_start(request: Request) -> Response:
     })
 
 
+async def _photon_refresh_line() -> dict:
+    """Re-read the assigned iMessage line from Photon and re-cache it.
+
+    The number we show is whatever provisioning wrote to auth.json, but on the
+    free shared-line tier that assignment lives on the Spectrum USER record
+    (``assignedPhoneNumber``) and is Photon's to change — there is no dedicated
+    /lines entry backing it. A cache written once at connect time would go on
+    displaying a number that no longer reaches the agent, and the failure is
+    silent: messages simply stop.
+
+    Mirrors the plugin's own refresh_user_numbers(). Needs only the project
+    credentials (Basic auth against Spectrum), not the device-login bearer, so
+    it keeps working long after the login token would have aged out.
+    Best-effort: any failure leaves the cached value untouched.
+    """
+    project_id, secret = _photon_creds()
+    if not (project_id and secret):
+        return {}
+    phone, cached = _photon_stored_numbers()
+    try:
+        resp = await get_http_client().get(
+            f"{_photon_host('spectrum')}/projects/{project_id}/users/",
+            headers=_photon_basic(project_id, secret), timeout=httpx.Timeout(15.0),
+        )
+        if resp.status_code >= 400:
+            return {}
+        users = _photon_unwrap_list(resp.json())
+    except (httpx.HTTPError, ValueError) as e:
+        print(f"[photon] could not refresh the assigned line: {e!r}", flush=True)
+        return {}
+
+    want = re.sub(r"[^\d+]", "", phone) if phone else ""
+    user = next(
+        (u for u in users
+         if want and re.sub(r"[^\d+]", "", str(u.get("phoneNumber") or "")) == want),
+        None,
+    )
+    if user is None and len(users) == 1:
+        # Single-operator deployment that predates us caching the phone number.
+        user = users[0]
+    if not user:
+        return {}
+
+    live = str(user.get("assignedPhoneNumber") or "")
+    if not live:
+        return {}
+    # `changed` only when we had a previous value to contradict — a first
+    # successful read is news to the cache, not a rotation the user should see.
+    changed = bool(cached) and live != cached
+    if live != cached:
+        _photon_store_numbers(
+            phone=str(user.get("phoneNumber") or "") or phone,
+            line=live,
+            user_id=str(user.get("id") or ""),
+            project_id=project_id,
+        )
+        if changed:
+            print(f"[photon] assigned iMessage line changed (was {cached}, now {live})", flush=True)
+    return {"line": live, "changed": changed}
+
+
 async def api_photon_status(request: Request) -> Response:
     if err := guard(request):
         return err
     project_id, secret = _photon_creds()
+    # ?refresh=1 asks Photon what the line is right now. The UI sends it on
+    # page load and from the explicit Recheck button, but NOT from the
+    # device-flow poll loop — that fires every few seconds and would hammer
+    # Spectrum for an answer that can't have changed mid-connect.
+    refreshed = {}
+    if request.query_params.get("refresh") and project_id and secret:
+        refreshed = await _photon_refresh_line()
     phone, line = _photon_stored_numbers()
     out = {
         "configured": bool(project_id and secret),
@@ -1376,12 +1444,21 @@ async def api_photon_status(request: Request) -> Response:
         "status": "none",
         "step": "",
         "error": "",
+        # True when this refresh found Photon had moved us to a different line.
+        "line_changed": bool(refreshed.get("changed")),
     }
     if _photon_state is not None:
         out["status"] = _photon_state["status"]
         out["step"] = _photon_state.get("step", "")
         out["error"] = _photon_state.get("error", "")
-        out["imessage_line"] = _photon_state.get("imessage_line") or line
+        # Persisted value wins over the in-flight one. _photon_state survives
+        # for the life of the process after a connect, holding whatever line
+        # was assigned back then — letting it override would make a refresh
+        # that DID find a new number look like it did nothing until the
+        # container restarted. Its own field is only authoritative mid-flow,
+        # before provisioning has written anything to disk.
+        out["imessage_line"] = line or _photon_state.get("imessage_line", "")
+        _photon_state["imessage_line"] = out["imessage_line"]
     elif out["configured"]:
         out["status"] = "connected"
     return JSONResponse(out)
